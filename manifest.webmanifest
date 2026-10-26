@@ -1,0 +1,10 @@
+{
+  "name": "KJV Study Companion",
+  "short_name": "KJV Study",
+  "description": "King James Bible reader with verse selection, Matthew Henry commentary import, Strong's tools, bookmarks, and dictionary resources.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#faf8f2",
+  "theme_color": "#233c32",
+  "icons": []
+}
