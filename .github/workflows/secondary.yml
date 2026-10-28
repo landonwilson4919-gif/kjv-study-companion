@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""
+bible_db_builder.py
+
+Builds a structured SQLite database from Bible, Strong's, Webster's 1828,
+and Matthew Henry commentary source files (JSON or text).
+
+Usage:
+    python bible_db_builder.py \
+        --bible path/to/bible.json \
+        --strongs path/to/strongs.json \
+        --webster path/to/webster.json \
+        --mhenry path/to/mhenry/   \
+        --output bible.db
+
+You will almost certainly need to adjust the four parser functions
+(parse_bible, parse_strongs, parse_webster, parse_mhenry) to match
+the exact shape of the files you already have.
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Canonical book list (Protestant 66 books)
+# ---------------------------------------------------------------------------
+BOOKS = [
+    # OT
+    (1,  "Gen",  "Genesis",          "OT"),
+    (2,  "Exod", "Exodus",           "OT"),
+    (3,  "Lev",  "Leviticus",        "OT"),
+    (4,  "Num",  "Numbers",          "OT"),
+    (5,  "Deut", "Deuteronomy",      "OT"),
+    (6,  "Josh", "Joshua",           "OT"),
+    (7,  "Judg", "Judges",           "OT"),
+    (8,  "Ruth", "Ruth",             "OT"),
+    (9,  "1Sam", "1 Samuel",         "OT"),
+    (10, "2Sam", "2 Samuel",         "OT"),
+    (11, "1Kgs", "1 Kings",          "OT"),
+    (12, "2Kgs", "2 Kings",          "OT"),
+    (13, "1Chr", "1 Chronicles",     "OT"),
+    (14, "2Chr", "2 Chronicles",     "OT"),
+    (15, "Ezra", "Ezra",             "OT"),
+    (16, "Neh",  "Nehemiah",         "OT"),
+    (17, "Esth", "Esther",           "OT"),
+    (18, "Job",  "Job",              "OT"),
+    (19, "Ps",   "Psalms",           "OT"),
+    (20, "Prov", "Proverbs",         "OT"),
+    (21, "Eccl", "Ecclesiastes",     "OT"),
+    (22, "Song", "Song of Solomon",  "OT"),
+    (23, "Isa",  "Isaiah",           "OT"),
+    (24, "Jer",  "Jeremiah",         "OT"),
+    (25, "Lam",  "Lamentations",     "OT"),
+    (26, "Ezek", "Ezekiel",          "OT"),
+    (27, "Dan",  "Daniel",           "OT"),
+    (28, "Hos",  "Hosea",            "OT"),
+    (29, "Joel", "Joel",             "OT"),
+    (30, "Amos", "Amos",             "OT"),
+    (31, "Obad", "Obadiah",          "OT"),
+    (32, "Jonah","Jonah",            "OT"),
+    (33, "Mic",  "Micah",            "OT"),
+    (34, "Nah",  "Nahum",            "OT"),
+    (35, "Hab",  "Habakkuk",         "OT"),
+    (36, "Zeph", "Zephaniah",        "OT"),
+    (37, "Hag",  "Haggai",           "OT"),
+    (38, "Zech", "Zechariah",        "OT"),
+    (39, "Mal",  "Malachi",          "OT"),
+    # NT
+    (40, "Matt", "Matthew",          "NT"),
+    (41, "Mark", "Mark",             "NT"),
+    (42, "Luke", "Luke",             "NT"),
+    (43, "John", "John",             "NT"),
+    (44, "Acts", "Acts",             "NT"),
+    (45, "Rom",  "Romans",           "NT"),
+    (46, "1Cor", "1 Corinthians",    "NT"),
+    (47, "2Cor", "2 Corinthians",    "NT"),
+    (48, "Gal",  "Galatians",        "NT"),
+    (49, "Eph",  "Ephesians",        "NT"),
+    (50, "Phil", "Philippians",      "NT"),
+    (51, "Col",  "Colossians",       "NT"),
+    (52, "1Thess","1 Thessalonians", "NT"),
+    (53, "2Thess","2 Thessalonians", "NT"),
+    (54, "1Tim", "1 Timothy",        "NT"),
+    (55, "2Tim", "2 Timothy",        "NT"),
+    (56, "Titus","Titus",            "NT"),
+    (57, "Phlm", "Philemon",         "NT"),
+    (58, "Heb",  "Hebrews",          "NT"),
+    (59, "Jas",  "James",            "NT"),
+    (60, "1Pet", "1 Peter",          "NT"),
+    (61, "2Pet", "2 Peter",          "NT"),
+    (62, "1John","1 John",           "NT"),
+    (63, "2John","2 John",           "NT"),
+    (64, "3John","3 John",           "NT"),
+    (65, "Jude", "Jude",             "NT"),
+    (66, "Rev",  "Revelation",       "NT"),
+]
+
+# Quick lookup helpers
+OSIS_TO_ID = {b[1]: b[0] for b in BOOKS}
+NAME_TO_ID = {b[2].lower(): b[0] for b in BOOKS}
+# also allow common abbreviations
+for bid, osis, name, _ in BOOKS:
+    NAME_TO_ID[osis.lower()] = bid
+    NAME_TO_ID[name.lower().replace(" ", "")] = bid
+
+
+def normalize_book(name: str) -> Optional[int]:
+    """Turn almost any book name/abbreviation into a book_id."""
+    if not name:
+        return None
+    key = re.sub(r"[^a-z0-9]", "", name.lower())
+    return NAME_TO_ID.get(key) or OSIS_TO_ID.get(name) or NAME_TO_ID.get(name.lower())
+
+
+# ---------------------------------------------------------------------------
+# Database schema + indexes
+# ---------------------------------------------------------------------------
+SCHEMA_SQL = """
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS books (
+    id          INTEGER PRIMARY KEY,          -- 1–66
+    osis        TEXT    NOT NULL UNIQUE,      -- Gen, Exod, Matt …
+    name        TEXT    NOT NULL,             -- Genesis, Matthew …
+    testament   TEXT    NOT NULL CHECK(testament IN ('OT','NT'))
+);
+
+CREATE TABLE IF NOT EXISTS verses (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id     INTEGER NOT NULL REFERENCES books(id),
+    chapter     INTEGER NOT NULL,
+    verse       INTEGER NOT NULL,
+    text        TEXT    NOT NULL,
+    UNIQUE(book_id, chapter, verse)
+);
+
+CREATE TABLE IF NOT EXISTS strongs (
+    number      TEXT    PRIMARY KEY,          -- H7225 or G26
+    language    TEXT    NOT NULL,             -- hebrew / greek
+    lemma       TEXT,
+    translit    TEXT,
+    pronunciation TEXT,
+    definition  TEXT,
+    kjv_def     TEXT,                         -- KJV gloss if available
+    derivation  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS webster (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    word        TEXT    NOT NULL COLLATE NOCASE,
+    pos         TEXT,                         -- part of speech
+    definition  TEXT    NOT NULL,
+    etymology   TEXT,
+    UNIQUE(word, pos)                         -- allow multiple senses
+);
+
+CREATE TABLE IF NOT EXISTS commentary (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id     INTEGER NOT NULL REFERENCES books(id),
+    chapter     INTEGER NOT NULL,
+    verse_start INTEGER,                      -- NULL = whole-chapter note
+    verse_end   INTEGER,
+    text        TEXT    NOT NULL
+);
+
+-- Optional: word-level Strong’s tagging (if you have interlinear data)
+CREATE TABLE IF NOT EXISTS verse_strongs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    verse_id    INTEGER NOT NULL REFERENCES verses(id),
+    position    INTEGER NOT NULL,             -- word order in the verse
+    word        TEXT,
+    strongs     TEXT    REFERENCES strongs(number)
+);
+
+-- Indexes for typical mobile-app queries
+CREATE INDEX IF NOT EXISTS idx_verses_lookup
+    ON verses (book_id, chapter, verse);
+CREATE INDEX IF NOT EXISTS idx_verses_chapter
+    ON verses (book_id, chapter);
+
+CREATE INDEX IF NOT EXISTS idx_strongs_lang
+    ON strongs (language);
+CREATE INDEX IF NOT EXISTS idx_strongs_lemma
+    ON strongs (lemma);
+
+CREATE INDEX IF NOT EXISTS idx_webster_word
+    ON webster (word COLLATE NOCASE);
+
+CREATE INDEX IF NOT EXISTS idx_commentary_lookup
+    ON commentary (book_id, chapter, verse_start);
+CREATE INDEX IF NOT EXISTS idx_commentary_chapter
+    ON commentary (book_id, chapter);
+
+CREATE INDEX IF NOT EXISTS idx_verse_strongs_verse
+    ON verse_strongs (verse_id);
+CREATE INDEX IF NOT EXISTS idx_verse_strongs_number
+    ON verse_strongs (strongs);
+"""
+
+
+def create_db(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA_SQL)
+    # seed books
+    conn.executemany(
+        "INSERT OR IGNORE INTO books (id, osis, name, testament) VALUES (?,?,?,?)",
+        BOOKS,
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Parsers – ADAPT THESE TO YOUR ACTUAL FILE FORMATS
+# ---------------------------------------------------------------------------
+
+def parse_bible(path: Path) -> List[Tuple[int, int, int, str]]:
+    """
+    Expected JSON shapes (pick the one that matches your files):
+
+    1) midvash / many modern dumps:
+       {
+         "books": [
+           {
+             "book": "Gen", "bookId": 1,
+             "chapters": [
+               {"chapter": 1, "verses": [{"number": 1, "text": "..."}, ...]}
+             ]
+           }, ...
+         ]
+       }
+
+    2) Simple nested dict:
+       {"Genesis": {"1": {"1": "In the beginning...", "2": "..."}, ...}, ...}
+
+    3) Flat list of verse objects:
+       [{"book": "Gen", "chapter": 1, "verse": 1, "text": "..."}, ...]
+
+    Returns list of (book_id, chapter, verse, text)
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows = []
+
+    # --- Shape 1: midvash-style ------------------------------------------
+    if isinstance(data, dict) and "books" in data:
+        for book in data["books"]:
+            bid = book.get("bookId") or normalize_book(book.get("book") or book.get("englishName"))
+            if not bid:
+                continue
+            for ch in book.get("chapters", []):
+                chap = ch.get("chapter") or ch.get("number")
+                for v in ch.get("verses", []):
+                    rows.append((
+                        bid,
+                        int(chap),
+                        int(v.get("number") or v.get("verse")),
+                        v["text"].strip()
+                    ))
+        return rows
+
+    # --- Shape 2: nested dict by book name -------------------------------
+    if isinstance(data, dict) and not any(k in data for k in ("books", "verses")):
+        for book_name, chapters in data.items():
+            bid = normalize_book(book_name)
+            if not bid:
+                print(f"  [bible] skipping unknown book: {book_name}")
+                continue
+            for chap_str, verses in chapters.items():
+                for verse_str, text in verses.items():
+                    rows.append((bid, int(chap_str), int(verse_str), text.strip()))
+        return rows
+
+    # --- Shape 3: flat list ----------------------------------------------
+    if isinstance(data, list):
+        for item in data:
+            bid = normalize_book(item.get("book") or item.get("book_name"))
+            if not bid:
+                continue
+            rows.append((
+                bid,
+                int(item["chapter"]),
+                int(item.get("verse") or item.get("number")),
+                item["text"].strip()
+            ))
+        return rows
+
+    raise ValueError(f"Unrecognized Bible JSON shape in {path}")
+
+
+def parse_strongs(path: Path) -> List[Tuple]:
+    """
+    Common formats:
+
+    1) openscriptures / many dumps (dict keyed by number):
+       {
+         "H7225": {
+           "lemma": "רֵאשִׁית",
+           "xlit": "re'shiyth",
+           "pron": "ray-sheeth'",
+           "strongs_def": "...",
+           "kjv_def": "beginning, ...",
+           "derivation": "..."
+         },
+         "G26": { ... }
+       }
+
+    2) Array of objects:
+       [{"strong": "H7225", "lemma": "...", "definition": "..."}, ...]
+
+    Returns list of tuples matching the strongs table columns.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows = []
+
+    if isinstance(data, dict):
+        items = data.items()
+    else:
+        items = ((item.get("strong") or item.get("number"), item) for item in data)
+
+    for number, entry in items:
+        number = str(number).upper().strip()
+        if not number.startswith(("H", "G")):
+            continue
+        lang = "hebrew" if number.startswith("H") else "greek"
+
+        rows.append((
+            number,
+            lang,
+            entry.get("lemma") or entry.get("word"),
+            entry.get("xlit") or entry.get("translit") or entry.get("transliteration"),
+            entry.get("pron") or entry.get("pronunciation"),
+            entry.get("strongs_def") or entry.get("definition") or entry.get("def"),
+            entry.get("kjv_def") or entry.get("kjv"),
+            entry.get("derivation") or entry.get("root"),
+        ))
+    return rows
+
+
+def parse_webster(path: Path) -> List[Tuple]:
+    """
+    Expected shapes:
+
+    1) Dict keyed by word:
+       {
+         "BEGINNING": {
+           "pos": "n.",
+           "definition": "...",
+           "etymology": "..."
+         },
+         ...
+       }
+
+    2) Array of objects:
+       [{"word": "BEGINNING", "pos": "n.", "definition": "..."}, ...]
+
+    3) Simple text dump (one entry per block) – you can extend this.
+
+    Returns list of (word, pos, definition, etymology)
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows = []
+
+    if isinstance(data, dict):
+        for word, entry in data.items():
+            if isinstance(entry, str):               # just a definition string
+                rows.append((word, None, entry, None))
+            else:
+                rows.append((
+                    word,
+                    entry.get("pos") or entry.get("part_of_speech"),
+                    entry.get("definition") or entry.get("def") or "",
+                    entry.get("etymology") or entry.get("etym"),
+                ))
+    elif isinstance(data, list):
+        for entry in data:
+            rows.append((
+                entry["word"],
+                entry.get("pos") or entry.get("part_of_speech"),
+                entry.get("definition") or entry.get("def") or "",
+                entry.get("etymology") or entry.get("etym"),
+            ))
+    else:
+        raise ValueError(f"Unrecognized Webster format in {path}")
+
+    return rows
+
+
+def parse_mhenry(path: Path) -> List[Tuple]:
+    """
+    Matthew Henry is usually distributed as:
+
+    - One big JSON
+    - Per-book Markdown / HTML / text files
+    - Directory of chapter files
+
+    This function handles two common cases and is easy to extend.
+
+    Case A – single JSON:
+      {
+        "Genesis": {
+          "1": {
+            "1": "commentary text for Gen 1:1",
+            "2": "...",
+            "chapter": "optional whole-chapter intro"
+          },
+          ...
+        },
+        ...
+      }
+
+    Case B – directory of Markdown files named like:
+      Gen_01.md  or  Genesis_1.md  or  01_Genesis.md
+      (content is free-form; we store the whole file against the chapter)
+    """
+    rows = []
+
+    if path.is_file() and path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for book_name, chapters in data.items():
+            bid = normalize_book(book_name)
+            if not bid:
+                continue
+            for chap_str, content in chapters.items():
+                chap = int(chap_str)
+                if isinstance(content, str):
+                    # whole-chapter commentary
+                    rows.append((bid, chap, None, None, content.strip()))
+                elif isinstance(content, dict):
+                    # verse-level + optional chapter intro
+                    if "chapter" in content:
+                        rows.append((bid, chap, None, None, content["chapter"].strip()))
+                    for v_str, text in content.items():
+                        if v_str == "chapter":
+                            continue
+                        try:
+                            v = int(v_str)
+                            rows.append((bid, chap, v, v, text.strip()))
+                        except ValueError:
+                            pass
+        return rows
+
+    # Directory of text/Markdown files
+    if path.is_dir():
+        for f in sorted(path.rglob("*")):
+            if f.suffix.lower() not in {".md", ".txt", ".html"}:
+                continue
+            # try to extract book + chapter from filename
+            m = re.search(
+                r"(?i)(gen|exod|lev|num|deut|josh|judg|ruth|1sam|2sam|1kgs|2kgs|"
+                r"1chr|2chr|ezra|neh|esth|job|ps|prov|eccl|song|isa|jer|lam|ezek|"
+                r"dan|hos|joel|amos|obad|jonah|mic|nah|hab|zeph|hag|zech|mal|"
+                r"matt|mark|luke|john|acts|rom|1cor|2cor|gal|eph|phil|col|"
+                r"1thess|2thess|1tim|2tim|titus|phlm|heb|jas|1pet|2pet|"
+                r"1john|2john|3john|jude|rev|"
+                r"genesis|exodus|leviticus|numbers|deuteronomy|joshua|judges|"
+                r"matthew|mark|luke|john|acts|romans|revelation)"
+                r"[_\-\s]*(\d+)",
+                f.stem
+            )
+            if not m:
+                print(f"  [mhenry] could not parse book/chapter from {f.name}")
+                continue
+            bid = normalize_book(m.group(1))
+            chap = int(m.group(2))
+            text = f.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                rows.append((bid, chap, None, None, text))
+        return rows
+
+    raise ValueError(f"Matthew Henry path must be a JSON file or a directory: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Loaders
+# ---------------------------------------------------------------------------
+
+def load_bible(conn: sqlite3.Connection, path: Path) -> int:
+    print(f"Loading Bible from {path} …")
+    rows = parse_bible(path)
+    conn.executemany(
+        "INSERT OR REPLACE INTO verses (book_id, chapter, verse, text) VALUES (?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    print(f"  → {len(rows):,} verses")
+    return len(rows)
+
+
+def load_strongs(conn: sqlite3.Connection, path: Path) -> int:
+    print(f"Loading Strong's from {path} …")
+    rows = parse_strongs(path)
+    conn.executemany(
+        """INSERT OR REPLACE INTO strongs
+           (number, language, lemma, translit, pronunciation, definition, kjv_def, derivation)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    conn.commit()
+    print(f"  → {len(rows):,} Strong's entries")
+    return len(rows)
+
+
+def load_webster(conn: sqlite3.Connection, path: Path) -> int:
+    print(f"Loading Webster's from {path} …")
+    rows = parse_webster(path)
+    conn.executemany(
+        "INSERT OR IGNORE INTO webster (word, pos, definition, etymology) VALUES (?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    print(f"  → {len(rows):,} Webster entries")
+    return len(rows)
+
+
+def load_mhenry(conn: sqlite3.Connection, path: Path) -> int:
+    print(f"Loading Matthew Henry from {path} …")
+    rows = parse_mhenry(path)
+    conn.executemany(
+        """INSERT INTO commentary
+           (book_id, chapter, verse_start, verse_end, text)
+           VALUES (?,?,?,?,?)""",
+        rows,
+    )
+    conn.commit()
+    print(f"  → {len(rows):,} commentary rows")
+    return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Build a SQLite Bible study database from source files"
+    )
+    parser.add_argument("--bible",   type=Path, help="Bible JSON file")
+    parser.add_argument("--strongs", type=Path, help="Strong's JSON file")
+    parser.add_argument("--webster", type=Path, help="Webster's 1828 JSON file")
+    parser.add_argument("--mhenry",  type=Path, help="Matthew Henry JSON or directory")
+    parser.add_argument("--output",  type=Path, default=Path("bible.db"),
+                        help="Output SQLite file (default: bible.db)")
+    parser.add_argument("--force",   action="store_true",
+                        help="Overwrite existing database")
+    args = parser.parse_args()
+
+    if args.output.exists() and not args.force:
+        print(f"{args.output} already exists. Use --force to overwrite.")
+        return
+
+    if args.output.exists():
+        args.output.unlink()
+
+    conn = sqlite3.connect(args.output)
+    try:
+        create_db(conn)
+
+        if args.bible:
+            load_bible(conn, args.bible)
+        if args.strongs:
+            load_strongs(conn, args.strongs)
+        if args.webster:
+            load_webster(conn, args.webster)
+        if args.mhenry:
+            load_mhenry(conn, args.mhenry)
+
+        # final vacuum for a compact file
+        print("Vacuuming …")
+        conn.execute("VACUUM")
+        conn.commit()
+
+        # quick stats
+        print("\n=== Database ready ===")
+        for table in ("books", "verses", "strongs", "webster", "commentary"):
+            n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            print(f"  {table:12} {n:>8,}")
+        print(f"\nFile: {args.output.resolve()}")
+        print(f"Size: {args.output.stat().st_size / 1_048_576:.1f} MB")
+
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
