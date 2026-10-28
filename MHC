@@ -1,0 +1,12 @@
+{
+  "Genesis": {
+    "1": "full Matthew Henry commentary for Genesis chapter 1...",
+    "2": "full commentary for Genesis chapter 2...",
+    ...
+  },
+  "Exodus": {
+    "1": "...",
+    ...
+  },
+  ...
+}
